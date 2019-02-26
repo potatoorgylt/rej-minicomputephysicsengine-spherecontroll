@@ -1,0 +1,139 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Main
+
+struct Entity
+{
+    float3 position;
+    float3 velocity;
+    float radius;
+    float massInverse;
+};
+
+RWStructuredBuffer<Entity> EntityBuffer;
+
+float3 _WorldBoundsMin;
+float3 _WorldBoundsMax;
+float3 _ExternalForce;
+float _DeltaTime;
+uint _Count;
+
+float _DragCoefficient;
+
+Entity Move(Entity e, float3 acceleration)
+{
+    // pos = pos + v * dt + a * dt^2 / 2
+    e.position += e.velocity * _DeltaTime + 0.5f * acceleration * _DeltaTime * _DeltaTime;
+    e.velocity += acceleration * _DeltaTime;
+
+    return e;
+}
+
+Entity WorldBoundsCollision(Entity e, float3 worldBoundsMin, float3 worldBoundsMax, float coeffOfRestitution)
+{
+    // Apply only if object is leaving horizontal boundaries
+    if ((e.position.x - e.radius < worldBoundsMin.x) && (e.velocity.x < 0) || 
+        (e.position.x + e.radius > worldBoundsMax.x) && (e.velocity.x > 0))
+    {
+        e.velocity.x = -coeffOfRestitution * e.velocity.x;
+        e.position.x = clamp(e.position.x, worldBoundsMin.x + e.radius, worldBoundsMax.x + e.radius);
+    }
+
+    // Apply only if object is leaving vertical boundaries
+    if ((e.position.y - e.radius < worldBoundsMin.y) && (e.velocity.y < 0) || 
+        (e.position.y + e.radius > worldBoundsMax.y) && (e.velocity.y > 0))
+    {
+        e.velocity.y = -coeffOfRestitution * e.velocity.y;
+        e.position.y = clamp(e.position.y, worldBoundsMin.y + e.radius, worldBoundsMax.y + e.radius);
+    }
+
+    // Apply only if object is leaving depth boundaries
+    if ((e.position.z - e.radius < worldBoundsMin.z) && (e.velocity.z < 0) || 
+        (e.position.z + e.radius > worldBoundsMax.z) && (e.velocity.z > 0))
+    {
+        e.velocity.z = -coeffOfRestitution * e.velocity.z;
+        e.position.z = clamp(e.position.z, worldBoundsMin.z + e.radius, worldBoundsMax.z + e.radius);
+    }
+
+    return e;
+}
+
+bool CheckSphereSphereCollision(float3 pos1, float r1, float3 pos2, float r2)
+{
+    // |pos1 - pos2| <= |r1+r2| is the same as
+    // (pos1 - pos2)^2 <= (r1+r2)^2
+    float3 d = pos1 - pos2;
+    return dot(d, d) <= (r2 + r1) * (r2 + r1);
+}
+
+float SphereSphereDistance(float3 pos1, float r1, float3 pos2, float r2)
+{
+    float3 d = pos1 - pos2;
+    return sqrt(dot(d, d)) - r1 - r2;
+}
+
+Entity Collision(Entity e, Entity other, float coeffOfRestitution, float coeffOfRepulsion)
+{
+    if (CheckSphereSphereCollision(e.position, e.radius, other.position, other.radius))
+    {
+        // Relative velocity
+        float3 relativeVelocity = other.velocity - e.velocity;
+        // Collision normal
+        float3 normal = normalize(other.position - e.position);
+
+        float velocityProjection = dot(relativeVelocity, normal);
+
+        // Process only, if objects are not separating
+        if (velocityProjection < 0)
+        {
+            // Impulse scale
+            float impScale = -(1.0f + coeffOfRestitution) * velocityProjection / (e.massInverse + other.massInverse);
+
+            float3 impulse = impScale * normal;
+
+            e.velocity -= e.massInverse * impulse;
+            e.position += normal * SphereSphereDistance(e.position, e.radius, other.position, other.radius) * coeffOfRepulsion;
+        }
+    }
+
+    return e;
+}
+
+float3 Drag(Entity e, float coefOfDrag)
+{
+    float dragForce = 0.5 * coefOfDrag * dot(e.velocity, e.velocity) * 3.14 * e.radius * e.radius;
+    return dot(e.velocity, e.velocity) > 0 ? -normalize(e.velocity) * dragForce: float3(0,0,0);
+}
+
+
+[numthreads(64, 1, 1)]
+//Full declaration: void Main(uint3 threadID : SV_DispatchThreadID, uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID, uint GI : SV_GroupIndex)
+void Main(uint threadID : SV_DispatchThreadID)
+{
+    float coeffOfRestitution = 0.5;
+    float coeffOfRepulsion = 0.25;
+
+    if (threadID >= _Count)
+        return;
+
+    Entity e = EntityBuffer[threadID.x];
+
+    float3 acceleration = _ExternalForce;
+    acceleration += Drag(e, _DragCoefficient);
+    e = Move(e, acceleration);
+    e = WorldBoundsCollision(e, _WorldBoundsMin, _WorldBoundsMax, coeffOfRestitution);
+
+    // Collide against all other entities
+    for (uint i = 0; i < _Count; ++i)
+    {
+        // Avoid self-collision
+        if (i == threadID)
+            continue;
+
+        Entity other = EntityBuffer[i];
+        e = Collision(e, other, coeffOfRestitution, coeffOfRepulsion);
+    }
+
+    EntityBuffer[threadID] = e;
+}
+
+
